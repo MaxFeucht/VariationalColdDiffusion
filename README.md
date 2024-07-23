@@ -7,7 +7,7 @@ We present Variational Cold Diffusion (VCD), a framework for diffusion-like syst
 
 VCD consists of a classic U-Net (Ronneberger et al., 2015) with a encoder-decoder structure as the diffusion model, or generator, and a second, variational encoder. The variational encoder has the same architecture as the regular U-Net encoder part, with the depth of feature maps decreased by a factor of 2 for parameter efficiency. During training, xt is used as an input to the U-Net to predict the less degraded latent xt−1. The variational encoder receives both xt and xt−1 and encodes the information to accurately predict xt−1 from xt by parameterizing a multivariate Gaussian by its means μφ and variances σφ. The resulting sampled latent zt is then used as a conditioning signal to the U-Net, together with the diffusion step embedding t. A schematic illustration of the VCD architecture is given in Figure 3. All variational mod- els were trained using the same architecture, only differing in their parameter settings.Non-variational models for baselines were trained using only the U-Net structure, without the variational encoder. Model dimension in 2 refers to the base dimension, which is multiplied in deeper feature maps.
 
-![Architecture](figures/architecture.png =250x250)
+![Architecture](figures/architecture.png "Architecture")
 
 
 ## Unconditional Samples
