@@ -4,4 +4,8 @@ We present Variational Cold Diffusion (VCD), a framework for diffusion-like syst
 
 
 
-![TransYNet architecture](TransYNet_architecture.png "TransYNet architecture")
+![Latent Exchange](figures/exchange.png "Latent Exchange")
+![Unconditional Samples](figures/unconditional.png "Unconditional Samples")
+![Generative Sequences](figures/sequences.png "Generative Sequences")
+![Architecture](figures/architecture.png "Architecture")
+
