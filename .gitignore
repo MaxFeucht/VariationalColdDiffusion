@@ -1,0 +1,8 @@
+data/
+models/
+imgs/
+wandb/
+root_cifar10/
+root_cifar10_test/
+.DS_Store
+output.out
