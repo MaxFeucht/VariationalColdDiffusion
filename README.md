@@ -1,4 +1,5 @@
-# VariationalColdDiffusion
+# Variational Cold Diffusion
+## for inductive bias control
 
 We present Variational Cold Diffusion (VCD), a framework for diffusion-like systems that couple a deterministic degradation opera- tor and a variational encoder to guide the reconstruction process. VCD separates the entropy of the forward and the reverse process, allowing for full generative control via the variational encoder. We demonstrate the benefits of this approach by exploiting the inductive bias of blurring degradation, which gives rise to an image generation process that iteratively adds low- to high-frequency image features. We find that data- level perturbation during training is essential to sample deterministic diffusion models sequentially, and propose two methods to achieve this: incorporating the model’s own bias into training and using minimal noise injections for perturbation. Our work contributes to understanding the dynamics in (deterministic) diffusion models and the role of Gaussian perturbation therein, and provides a general framework for controlling the inductive biases of arbitrary deterministic degradation operators.
 
@@ -23,7 +24,7 @@ Generative sequences for VCD and VWD, showing the intended inductive bias of ite
 
 ![Latent Exchange](figures/exchange.png "Latent Exchange")
 
-# Generative Control
+## Generative Control
 
 The generative process can be controlled through the variational latents used at every reconstruction step. We investigate the impact of this generative control by exchanging the latents used to generate a target image with those of a source im- age at different reconstruction steps, similar to the procedure described in Karras et al. (2019) for decoder layers instead of diffusion steps. Latent exchanges early on in the generation process should transfer low-frequency information from the source towards the target, exchanges higher up the generative trajectory should impact mid- and high-frequency features.
 
