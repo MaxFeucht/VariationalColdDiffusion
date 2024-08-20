@@ -73,12 +73,7 @@ class Scheduler:
 
     
     def get_bansal_blur_schedule(self, timesteps, std = 0.01, type = 'exponential'):
-        
-        # 0.01 * t + 0.35 CIFAR-10
-        
-        # MNIST:
-        # Rissanen: Max of 20, min of 0.5, interpolated --> Investigate more clearly in the future and also use Hoogeboom for further explanation (blurring schedule slightly better explained there)
-        # Bansal: Constant 7, recursive application
+
 
         # The standard deviation of the kernel starts at 1 and increases exponentially at the rate of 0.01.        
         if type == 'constant':
@@ -126,9 +121,6 @@ class Scheduler:
             
         return coefs.reshape(-1, 1, 1, 1).to(self.device)
 
-
-
-       
         
         
 class Degradation:
@@ -244,9 +236,6 @@ class Degradation:
 
         return torch.stack(blur_t)
     
-
-
-
 
     def bansal_blackblurring_xt(self, x_tm1, t):
         """
@@ -620,12 +609,12 @@ class Trainer:
         self.loss_weighting = kwargs['loss_weighting']
         self.min_t2_step = kwargs['min_t2_step']
         self.kwargs = kwargs
-        self.add_noise = kwargs['add_noise']
+        self.add_noise = kwargs['vwd']
         self.autoencoder = kwargs['autoencoder']
-        self.cold_perturb = kwargs['cold_perturb']
+        self.vcd = kwargs['vcd']
         self.perturb_counter = 0
 
-        if self.cold_perturb:
+        if self.vcd:
             self.teacher = copy.deepcopy(model)
             self.teacher.eval()
 
@@ -707,10 +696,10 @@ class Trainer:
 
             # Cold bootstrapping perturbation using a teacher model that inherits the weights of the EMA model, parallel to sampling
             # Using EMA to stabilize the teacher model, as single model predictions are highly fluctuating
-            if self.cold_perturb:                  
+            if self.vcd:                  
                 
-                # # Fix random seed for perturbation dropout
-                # torch.manual_seed(torch.randint(0, 100000, (1,)).item())
+                # Fix random seed for perturbation dropout
+                torch.manual_seed(torch.randint(0, 100000, (1,)).item())
 
                 p = 0.125
                 if self.anneal_counter > 500:
@@ -719,8 +708,6 @@ class Trainer:
                     self.teacher.load_state_dict(self.model.state_dict())
                     p = 0.3
                 
-                #self.teacher.load_state_dict(self.model.state_dict())
-
                 if self.perturb_counter == 0:
 
                     # Generate the full (conditional) sampling trajectory, then select the correct prediction for each image in the batch
@@ -732,16 +719,7 @@ class Trainer:
                         model_preds = []
                         x_t_hat = x_T
 
-                        if consistency:
-                            end_idx = -1
-                        else:
-                            model_preds.append(x_t_hat) # I CHANGED THIS TO MIMICK DARAS!!!! 
-                            end_idx = 0
-                    
-
-                        # x_t_prime right now gives the sampled model predictions on THE SAME LEVEL AS THE ACTUAL MODEL PREDICTIOn, which we want to compare the model prediction to
-                        # If normal bootstrapping approach is wanted back, change range to (self.timesteps-1, 0, -1) and uncomment the line above
-                        for i in range(self.timesteps-1, end_idx, -1): ## +1 to account for zero indexing of range  
+                        for i in range(self.timesteps-1, -1, -1): ## +1 to account for zero indexing of range  
                             
                             tp = torch.ones_like(t) * i
                             t2p = tp - self.min_t2_step
@@ -769,22 +747,17 @@ class Trainer:
                 else:
                     self.perturb_counter += 1
 
-            if not consistency and self.cold_perturb:
+            if not consistency and self.vcd:
                 x_t = x_t_prime
 
             # Condition VAE on target
             cond = target
-            # cond = x_0
             model_pred, kl_div = self.model(x_t, t, cond, t2=t2) # VAE Model needs conditioning signal for prediction
 
             # Testing to include VAE Noise into Loss, just as in Risannen. 
             # We do this by adding the noise to x_t and let the model optimize for the difference between the perturbed x_t and xtm1.
             if self.kwargs['vae_loc'] == 'bold':
                 x_t = x_t + self.model.vae_noise 
-
-            # # ONLY A TRIAL FOR RISANNEN EQUIVALENCE
-            # if self.add_noise:
-            #     x_t = x_t + self.model.perturbation_noise # Perturb x_t with noise for Risannen Loss
 
             # Risannen Loss Formulation - Here the slightly perturbed x_t is used for the prediction
             if self.prediction in ['xt', 'vxt']: # Check if that really helps for vxt
@@ -799,7 +772,7 @@ class Trainer:
                 reconstruction = torch.sum(reconstruction.reshape(reconstruction.shape[0], -1), dim=-1).mean() 
 
                 # CP Addition
-                if consistency and self.cold_perturb:
+                if consistency and self.vcd:
                     cp = (x_t_prime - pred)**2
                     cp = torch.sum(cp.reshape(cp.shape[0], -1), dim=-1).mean()
                     reconstruction = reconstruction + cp * 0.05 # Add the consistency property to the reconstruction loss
@@ -853,15 +826,10 @@ class Trainer:
         else:
 
             model_pred = self.model(x_t, t, t2=t2) # Model prediction without VAE 
-            
-            # # ONLY A TRIAL FOR RISANNEN EQUIVALENCE
-            # if self.add_noise:
-            #     x_t = x_t + self.model.perturbation_noise # Perturb x_t with noise for Risannen Loss
 
             # Risannen Loss Formulation - Here the slightly perturbed x_t is used for the prediction
             if self.prediction in ['xt', 'vxt']: # Check if that really helps for vxt
                 pred = (x_t + model_pred)
-                #pred = model_pred
             else:
                 pred = model_pred
 
@@ -940,11 +908,6 @@ class Trainer:
                 # Update EMA
                 if self.apply_ema:
                     self.model_ema.update(self.model.parameters())
-                
-                # # Copy model to teacher for stable predictions during cold perturbation
-                # if self.cold_perturb:
-                #     self.model_ema.copy_to(self.teacher.parameters())
-                #     self.teacher.eval()
             
             # Break prematurely if args.test_run
             if self.test_run:
@@ -952,11 +915,9 @@ class Trainer:
         
         # Update LR Scheduler 
         if not self.vae or self.autoencoder: # for non-VAE setting
-            #self.lr_scheduler.step(epoch_loss)
             self.lr_scheduler.step()
             print('Last LR: ', self.lr_scheduler.get_last_lr())
         elif self.vae and not self.autoencoder: # for VAE setting
-            #self.lr_scheduler.step(epoch_reconstruction) # don't use kl_div for LR scheduling
             self.lr_scheduler.step()
             print('Last LR: ', self.lr_scheduler.get_last_lr())
 
@@ -983,7 +944,7 @@ class Sampler:
         self.noise_scale = kwargs['noise_scale']
         self.loss_weighting = kwargs['loss_weighting']
         self.kwargs = kwargs
-        self.add_noise = kwargs['add_noise']
+        self.add_noise = kwargs['vwd']
         self.tacos = False if self.add_noise else True
 
 
@@ -1039,7 +1000,6 @@ class Sampler:
                 x_t = x_t.float()
                     
             # Noise injection for breaking symmetry
-            # Original code: noise_levels = [0.001, 0.002, 0.003, 0.004] # THIS GIVES US A HINT THAT THE NOISE LEVELS HAVE TO BE FINELY TUNED
             if self.ris_noise:
                 x_t = x_t + torch.randn_like(x_t, device=self.device) * self.noise_scale
         
@@ -1081,32 +1041,12 @@ class Sampler:
             model_pred = model(x_t, t_tensor)
             x_0_hat = self.reconstruction.reform_pred(model_pred, x_t, t_tensor, return_x0 = True) # Obtain the estimate of x_0 at time t to sample from the posterior distribution q(x_{t-1} | x_t, x_0)
             x_0_hat.clamp_(-1, 1) # Clip the estimate to the range [-1, 1]
-
-            # # Scale noise to same brightness as x_0_hat 
-            # if self.black:
-            #     if t != 0:
-            #         z = posterior_var * z * self.degradation.blacking_coefs[t-1] + (1-posterior_var) * z # Tradeoff between blacked noise and normal noise - The more we are in the fully noisy regime (large post var), we darken noise a lot, when var --> 0, we use original noise more 
-
             x_t_m1 = posterior_mean_xt * x_t + posterior_mean_x0 * x_0_hat + torch.sqrt(posterior_var) * z # Sample x_{t-1} from the posterior distribution q(x_{t-1} | x_t, x_0)
 
             x_t = x_t_m1
             samples.append(x_t) 
 
         return samples, ret_x_T
-
- 
-    @torch.no_grad() 
-    def sample_ddim(self, model, batch_size):
-        
-        # Sample x_T either every time new or once and keep it fixed 
-        if self.x_T is None:
-            x_t = self.sample_x_T(batch_size, model.channels, model.image_size)
-        else:
-            x_t = self.x_T
-        
-        # To be implemented
-            
-        pass
  
 
     @torch.no_grad()
@@ -1138,8 +1078,6 @@ class Sampler:
 
         if t_diff != 1:
             print(f"Sampling with t_diff = {t_diff} and steps = {steps}")
-            #assert self.prediction == 'vxt', "Skipping sampling steps only works for Variable Timestep Diffusion" 
-
         
         # Changing Sampling Noise every time we sample, but not in loop 
         if self.add_noise and self.prediction != 'x0':
@@ -1157,10 +1095,6 @@ class Sampler:
                     t2 = torch.full((batch_size,), t-t_diff, dtype=torch.long).to(self.device)
                 if not generate:
                     cond = self.degradation.degrade(x0, t2) # Condition on the true less degraded image                    
-
-            # # TRIAL FOR VARIED SAMPLING NOISE - Comment for fixed sampling noise
-            # if self.add_noise and self.prediction != 'x0':
-            #     model.sample_noise = torch.randn_like(xt).to(xt.device) * model.noise_scale
 
             if self.vae:
                 pred, _ = model(xt, t_tensor, cond=cond, prior=prior, t2=t2)
@@ -1185,7 +1119,6 @@ class Sampler:
                     xt_hat = self.degradation.degrade(x0_hat, t_tensor)
                     xtm1_hat = self.degradation.degrade(x0_hat, t_tensor - 1) # This returns x0_hat for t=0
                     xtm1 = xt - xt_hat + xtm1_hat
-                    #xtm1 = self.degradation.degrade(x0_hat, t_tensor - 1)
 
                 if direct_recons == None:
                     direct_recons = x0_hat
@@ -1194,36 +1127,16 @@ class Sampler:
             # OURS with xt prediction (includes variable timestep prediction)
             elif self.prediction == 'xt' or (self.prediction == 'vxt' and t_diff != -1):
 
-                # # Add noise to pred (instead of xt, doesn't matter in the end), only in non-x0 prediction
-                # if self.add_noise:
-                #     xt = xt + model.sample_noise[:xt.shape[0]] # Add noise to the prediction, not to the image
-
                 # Risannen Analogue
                 if self.kwargs['vae_loc'] == 'bold':
                     xt = xt + model.vae_noise #* 1.25
 
-                #xtm1 = pred
-                xtm1 = (xt + pred) if (self.ris_noise or self.add_noise or self.vae) else pred # According to Risannen, the model predicts the residual, which stabilizes the training
-
-                # # To cancel out the effect of target weighting from training
-                # if self.loss_weighting:
-                #     #weight = (1 - (t_tensor / self.timesteps)).reshape(-1, 1, 1, 1)
-                #     weight = self.degradation.blacking_coefs[t_tensor-1].reshape(-1, 1, 1, 1)
-                #     weight[t_tensor == 0] = 1.0
-                #     xtm1 = xtm1 * weight #self.weight
-
-                # Bansal-style sampling
-                # if 'bansal' in self.degradation.degradation:
-                #     xtm1_model = xtm1
-                #     xt_hat = self.degradation.bansal_blackblurring_xt(xtm1, t_tensor) 
-                #     xtm1 = xt - xt_hat + xtm1_model # Counter the bias of the model prediction by having it incorporated two times in the sampling process
-
+                xtm1 = (xt + pred) if (self.ris_noise or self.add_noise or self.vae) else pred # According to Risannen, residual prediction stabilizes the training
 
             # OURS with residual prediction
             elif self.prediction == 'residual':
                 residual = pred
                 xtm1 = xt + residual
-
 
             # In Risannen the noise is added to the predicted image, AFTER the model prediction
             if self.ris_noise and not t == 0:
@@ -1298,7 +1211,6 @@ class DCTBlurSampling(nn.Module):
         if t is None:
             t = sigmas**2/2
         else:
-            #assert t.shape == sigmas.shape, f"t must be of equal shape as sigmas, got {t.shape} as shape instead of {sigmas.shape}."
             pass
             
         dct_coefs = torch_dct.dct_2d(x, norm='ortho')
@@ -1313,142 +1225,7 @@ class DCTBlurSampling(nn.Module):
 
         return dct_blurred
     
-class VarTSampler():
 
-    def __init__(self, trainer, **kwargs):
-        self.trainer = trainer
-        self.device = kwargs['device']
-        self.model = trainer.model
-        self.model.eval()
-        self.timesteps = kwargs['timesteps']
-        self.n_samples = kwargs['n_samples'] 
-        self.T = torch.full((self.n_samples,), self.timesteps-1, dtype=torch.long).to(kwargs['device'])
-        self.xT = torch.zeros((self.n_samples, kwargs['channels'], kwargs['image_size'], kwargs['image_size']), device=kwargs['device']) 
-        self.add_noise = kwargs['add_noise']
-
-        # Fix Prior for VAE
-        if not kwargs['vae_loc'] == 'bold':
-            self.prior = torch.randn((self.n_samples, kwargs['latent_dim'])).to(kwargs['device'])        
-        else: 
-            self.prior = torch.randn((self.n_samples, kwargs['channels'], kwargs['image_size'], kwargs['image_size'])).to(kwargs['device'])
-        
-        # Fix Prior for VAE
-        if not kwargs['vae_loc'] == 'bold' and not kwargs['multiscale_vae']:
-            self.prior = torch.randn((kwargs['n_samples'], kwargs['latent_dim'])).to(kwargs['device'])        
-        elif kwargs['vae_loc'] == 'bold' and not kwargs['multiscale_vae']:
-            self.prior = torch.randn((kwargs['n_samples'], kwargs['channels'], kwargs['image_size'], kwargs['image_size'])).to(kwargs['device'])
-        elif kwargs['multiscale_vae']:
-            self.prior = torch.randn((kwargs['n_samples'], len(kwargs['ch_mult']), kwargs['latent_dim'])).to(kwargs['device'])
-
-
-        
-        self.dct = DCTBlurSampling(trainer.degradation.dct_blur.blur_sigmas, kwargs['image_size'], kwargs['device'])
-
-    
-    @torch.no_grad()
-    def full_loop(self, step_size, t_int = 0, mean = 0, std = 1, dim = 0, plot = True, bansal_sampling = True):
-
-        steps = self.timesteps // step_size
-        
-        # Choose t to inject
-        t_inject = steps if t_int > steps else steps - 1
-
-        xt = self.xT
-        samples = torch.Tensor(xt[0])
-        
-        # Bansal-style sampling
-        if bansal_sampling:
-            skip_steps = 1
-            bansal_flag = "Bansal"
-        else:
-            skip_steps = step_size-1 if step_size == self.timesteps else step_size
-            #skip_steps = 1 if step_size == kwargs['timesteps'] else skip_steps
-            bansal_flag = "Regular"
-            
-        # Loop differs from the sequential one, as we go back to t-1 at every step
-        for i in tqdm(range(self.timesteps-1, -1, -skip_steps), total = self.timesteps // skip_steps, desc = f'Sampling {bansal_flag} with step size of {step_size}'):
-            
-            t = torch.full((self.n_samples,), i, dtype=torch.long).to(self.device)
-            t2 = torch.full((self.n_samples,), i-step_size, dtype=torch.long).to(self.device)
-            
-            if t2[0].item() < 0: # Equals to x0 prediction
-                t2 = torch.full((self.n_samples,), -1, dtype=torch.long).to(self.device) # t-1 to account for 0 indexing that the model is seeing during training
-
-            # if not bansal_sampling:
-            #     print(f"t = {t[0].item()}, t2 = {t2[0].item()}")
-            
-            #prior = self.manipulate_prior(dim, mean, std) if i == t_inject else None
-            prior = self.prior
-            if self.trainer.vae:
-                pred, _ = self.model(xt, t, cond=None, prior=prior, t2=t2)
-            else:
-                pred = self.model(xt, t, t2=t2)
-            pred = pred.detach()
-
-            # # Add noise to pred (instead of xt, doesn't matter in the end), only in non-x0 prediction
-            # if self.add_noise:
-            #     xt = xt + self.model.sample_noise[:xt.shape[0]] # Add noise to the prediction, not to the image
-        
-            xtm1_model = xt + pred
-            samples = torch.cat((samples, xtm1_model[0]), dim=0)
-
-            # Bansal Part
-            if bansal_sampling:
-                if step_size == self.timesteps:
-                    
-                    xt_hat = self.trainer.degradation.degrade(xtm1_model, t)
-                    xtm1_hat = self.trainer.degradation.degrade(xtm1_model, t-1)
-                    
-                else:
-
-                    # Calculcate reblurring for DCT
-                    stdt = self.trainer.degradation.blur.dct_sigmas[t[0].item()] 
-                    stdtm1 = self.trainer.degradation.blur.dct_sigmas[t[0].item()-1]
-                    stdt2 = self.trainer.degradation.blur.dct_sigmas[t2[0].item()] if t2[0].item() != -1 else 0
-
-                    # Manually calculating DCT timesteps
-                    t_dct = torch.full((self.n_samples,), stdt**2/2, dtype=torch.float32)[:, None, None, None].to(self.device)
-                    tm1_dct = torch.full((self.n_samples,), stdtm1**2/2, dtype=torch.float32)[:, None, None, None].to(self.device)
-                    t2_dct = torch.full((self.n_samples,), stdt2**2/2, dtype=torch.float32)[:, None, None, None].to(self.device)
-                    
-                    # Calculate DCT differences to get to t / t-1 from t2
-                    t_diff_dct = t_dct - t2_dct
-                    tm1_diff_dct = tm1_dct - t2_dct
-
-                    # Undo Blacking
-                    blacking_coef = self.trainer.degradation.blacking_coefs[t2[0].item()] if t2[0].item() != -1 else 1
-                    xtm1_model = xtm1_model / blacking_coef
-
-                    # Reblur to t / t-1 from t2
-                    xt_hat = self.dct(xtm1_model, t=t_diff_dct) 
-                    xtm1_hat = self.dct(xtm1_model, t=tm1_diff_dct)
-
-                    # Reapply Blacking
-                    xt_hat = xt_hat * self.trainer.degradation.blacking_coefs[t[0].item()]
-                    xtm1_hat = xtm1_hat * self.trainer.degradation.blacking_coefs[t[0].item() - 1]
-
-                    # Check for NAs
-                    assert not torch.isnan(xtm1_hat).any() 
-
-                    if t[0].item()-1 == -1:
-                        xtm1_hat = xtm1_model # Keep the original image for t=-1 (needed for Bansal style sampling)
-                        #assert torch.equal(xtm1_hat[0], xtm1_model[0]), f"DCT reblurring failed, xtm1_hat is not equal to xtm1_model with xtm1_hat = {xtm1_hat[0,0,0]} and xtm1_model = {xtm1_model[0,0,0]}"
-
-                xt = xt - xt_hat + xtm1_hat # Counter the bias of the model prediction by having it incorporated two times in the sampling process
-                samples = torch.cat((samples, xt[0]), dim=0)
-
-            else:
-                xt = xtm1_model
-                #samples = torch.cat((samples, xt[0:5]), dim=0)
-                if t[0].item() < step_size:
-                    break
-        
-        return samples, xt
-
-
-    def manipulate_prior(self, dim, mean = 0, std = 1):
-        man_prior = self.prior[:,dim] * std + mean
-        return man_prior
 
 
 

@@ -1,4 +1,4 @@
-import configargparse
+import argparse
 import numpy as np
 import os
 import sys
@@ -21,7 +21,7 @@ from scripts.nets.unet import Unet
 from scripts.diffusion import Degradation, Trainer, Sampler, ExponentialMovingAverage
 from scripts.utils import load_dataset, plot_degradation, create_dirs, save_video, save_single_imgs, save_gif, MyCelebA
 
-#from sampler import sample_func
+from sampler import sample_func
 
 import torch.multiprocessing as mp
 mp.set_start_method('spawn', force=True)
@@ -89,7 +89,7 @@ def main(**kwargs):
                         dropout=dropout,
                         ch_mult=ch_mult,
                         latent_dim = kwargs['latent_dim'],
-                        add_noise=kwargs['vwd'],
+                        add_noise=kwargs['add_noise'],
                         noise_scale= kwargs['noise_scale'],
                         var_timestep=True if kwargs['prediction'] in ['xt', 'vxt'] else False,
                         vae_loc = kwargs['vae_loc'],
@@ -105,7 +105,7 @@ def main(**kwargs):
                     attention_levels=attention_levels,
                     dropout=dropout,
                     ch_mult=ch_mult,
-                    add_noise=kwargs['vwd'],
+                    add_noise=kwargs['add_noise'],
                     noise_scale= kwargs['noise_scale'],
                     t2=True if kwargs['prediction'] in ['xt', 'vxt'] else False)
 
@@ -121,7 +121,7 @@ def main(**kwargs):
                         dropout=dropout,
                         ch_mult=ch_mult,
                         latent_dim = kwargs['latent_dim'],
-                        add_noise=kwargs['vwd'],
+                        add_noise=kwargs['add_noise'],
                         noise_scale= kwargs['noise_scale'],
                         var_timestep=True if kwargs['prediction'] in ['xt', 'vxt'] else False,
                         vae_loc = kwargs['vae_loc'],
@@ -261,7 +261,7 @@ def main(**kwargs):
                 
                     save_image(gen_all_images, os.path.join(imgpath, f'prior_{e}.png'), nrow=nrow)
 
-                    if kwargs['vcd']:
+                    if kwargs['cold_perturb']:
                         save_gif(gen_samples, imgpath, nrow, f'sample_{e}.gif')
 
                 else:
@@ -292,6 +292,16 @@ def main(**kwargs):
                     'kwargs': kwargs,
                 }
                 torch.save(chkpt, os.path.join(modelpath, f"chpkt_{kwargs['dim']}_{kwargs['timesteps']}_{kwargs['prediction']}{ema_flag}.pt"))
+        
+        # # Sample Function for VXT
+        # if kwargs['prediction'] == 'vxt' and not kwargs['autoencoder']:
+        #     if e % 20 == 0: 
+        #         sample_args = kwargs.copy()
+        #         sample_args['trainer'] = trainer
+        #         sample_args['cluster'] = True
+        #         sample_args['sampling_steps'] = [kwargs['min_t2_step']]
+        #         sample_args['e'] = e
+        #         sample_func(**sample_args)
 
         
     ## Calculate FID
@@ -362,36 +372,33 @@ def main(**kwargs):
 
 if __name__ == "__main__":
     
-    parser = configargparse.ArgumentParser(default_config_files=['/etc/app/conf.d/*.conf', '~/.my_settings'])
-
-    # Config file arg
-    parser.add('-c', '--config', required=True, is_config_file=True, default='config/mnist.txt', help='config file path')
+    parser = argparse.ArgumentParser(description='Diffusion Models')
 
     # General Diffusion Parameters
-    parser.add_argument('--timesteps', type=int, default=6, help='Degradation timesteps')
-    parser.add_argument('--prediction', type=str, default='vxt', help='Prediction method, choose one of [x0, xt, residual]')
+    parser.add_argument('--timesteps', '--t', type=int, default=6, help='Degradation timesteps')
+    parser.add_argument('--prediction', '--pred', type=str, default='vxt', help='Prediction method, choose one of [x0, xt, residual]')
     parser.add_argument('--dataset', type=str, default='mnist', help='Dataset to run Diffusion on. Choose one of [mnist, cifar10, celeba, lsun_churches]')
-    parser.add_argument('--degradation', type=str, default='black_blur', help='Degradation method')
-    parser.add_argument('--batch_size', type=int, default=64, help='Batch size')
-    parser.add_argument('--dim', type=int , default=64, help='Model dimension')
+    parser.add_argument('--degradation', '--deg', type=str, default='black_blur', help='Degradation method')
+    parser.add_argument('--batch_size', '--b', type=int, default=64, help='Batch size')
+    parser.add_argument('--dim', '--d', type=int , default=64, help='Model dimension')
     parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
-    parser.add_argument('--epochs', type=int, default=3, help='Number of Training Epochs')
-    parser.add_argument('--noise_schedule', type=str, default='cosine', help='Noise schedule')
+    parser.add_argument('--epochs', '--e', type=int, default=3, help='Number of Training Epochs')
+    parser.add_argument('--noise_schedule', '--sched', type=str, default='cosine', help='Noise schedule')
     parser.add_argument('--loss_weighting', action='store_true', help='Whether to use weighting for reconstruction loss')
     parser.add_argument('--var_sampling_step', type=int, default = 1, help='How to sample var timestep model - int > 0 indicates t difference to predict, -1 indicates x0 prediction')
     parser.add_argument('--min_t2_step', type=int, default=1, help='With what min step size to discretize t2 in variational timestep model')
-    parser.add_argument('--baseline', type=str, default='xxxx', help='Whether to run a baseline model - Risannen, Bansal, VAE')
+    parser.add_argument('--baseline', '--base', type=str, default='xxxx', help='Whether to run a baseline model - Risannen, Bansal, VAE')
     parser.add_argument('--multiscale_vae', action='store_true', help='Whether to use multiscale vae encoder instead of normal vae encoder')
     parser.add_argument('--autoencoder', action='store_true', help='Whether to use autoencoder instead of vae encoder')
     parser.add_argument('--kl_annealing', type=int, default = 5000, help='Number of epochs in which to anneal KL divergence')
+    parser.add_argument('--cold_perturb', action='store_true', help='Whether to use cold perturbation')
 
     # Noise Injection Parameters
     parser.add_argument('--vae', action='store_true', help='Whether to use VAE Noise injections')
     parser.add_argument('--vae_beta', type=float, default = 0.1, help='Trade-off parameter for weight of Reconstruction and KL Div')
     parser.add_argument('--latent_dim', type=int, default=32, help='Which dimension the VAE latent space is supposed to have')
     parser.add_argument('--ris_noise', action='store_true', help='Whether to add noise Risannen et al. style')
-    parser.add_argument('--vcd', action='store_true', help='Whether to use cold perturbation to yield VCD.')
-    parser.add_argument('--vwd', action='store_true', help='Whether to add noise in the forward process to yield VWD.')
+    parser.add_argument('--add_noise', action='store_true', help='Whether to add noise somewhere in the process')
     parser.add_argument('--break_symmetry', action='store_true', help='Whether to add noise to xT Bansal et al. style')
     parser.add_argument('--noise_scale', type=float, default = 0.01, help='How much Noise to add to the input')
     parser.add_argument('--vae_loc', type=str, default = 'emb', help='Where to inject VAE Noise. One of [start, bottleneck, emb].')
@@ -407,7 +414,7 @@ if __name__ == "__main__":
     parser.add_argument('--model_ema_decay', type=float, default=0.998, help='Model EMA decay')
     parser.add_argument('--cluster', action='store_true', help='Whether to run script locally')
     parser.add_argument('--skip_wandb', action='store_true', help='Whether to skip wandb logging')
-    parser.add_argument('--verbose', action='store_true', help='Verbose mode')
+    parser.add_argument('--verbose', '--v', action='store_true', help='Verbose mode')
     parser.add_argument('--multi_gpu', action='store_true', help='Whether to use multi-gpu training')
     parser.add_argument('--fid_only', action='store_true', help='Whether to calculate only the FID score')
 
@@ -476,17 +483,14 @@ if __name__ == "__main__":
         print("Running Test Run with only one iter per epoch")
 
     if args.vae:
-        if args.vcd:
-            setup_string = "with VAE Noise Injections"
-        elif args.vwd:
-            setup_string = "with error perturbation VAE"
+        setup_string = "using VAE Noise Injections"
+        # assert not args.ris_noise, "Cannot use VAE and add Risannen noise at the same time"
     else:
         if args.ris_noise:
             setup_string = "with Risannen Noise Injections"
         else:
-            setup_string = ""
-
-
+            setup_string = "with Normal U-Net"
+    
     print(var_string + " " + setup_string)
     
     # Initialize wandb

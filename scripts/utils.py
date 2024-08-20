@@ -10,13 +10,13 @@ from torchvision.datasets import CelebA
 from torchvision import transforms as T
 
 from scripts.diffusion import Degradation, Trainer, Sampler, ExponentialMovingAverage
-from scripts.data.datasets import load_data
+from scripts.datasets.datasets import load_data
 
 
 def create_dirs(**kwargs):
 
     vae_flag = "_vae" if kwargs["vae"] else ""
-    noise_flag = "_noise" if kwargs["add_noise"] else ""
+    noise_flag = "_noise" if kwargs["vwd"] else ""
     vae_inject_flag = "_" + kwargs["vae_inject"] if kwargs["vae"] else ""
 
     # Check if directory for imgs exists

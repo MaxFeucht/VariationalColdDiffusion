@@ -1263,18 +1263,12 @@ class VAEUnet(nn.Module):
         # Noise that acts as perturbation to the input - only in training mode
         if self.add_noise: 
             if th.is_grad_enabled():
-                #self.counter += 1
-                #self.noise_level = min((self.counter / self.max_noise_counter),1)
-                #xt = xt + self.perturbation_noise * self.noise_level
                 xt = xt + self.perturbation_noise
             else:
-                # xt = xt + self.sample_noise[:xt.shape[0]] #* self.noise_level #* 0 # * 0.5
                 pass
 
         # VAE Injection at start 
         if self.vae_loc == 'bold':
-            # self.vae_noise = th.randn(xt.shape[0], self.in_channels, self.image_size, self.image_size).to(xt.device) * 0.01
-            # self.vae_noise = self.vae_noise.view(xt.shape[0], self.in_channels, self.image_size, self.image_size) # * self.inject_scale
             xt = xt + self.vae_noise.view(xt.shape[0], self.in_channels, self.image_size, self.image_size)
 
         # VAE Injection at start
@@ -1284,18 +1278,6 @@ class VAEUnet(nn.Module):
         # VAE Injection at timestep embedding
         if self.vae_loc == 'emb':
             emb = self.vae_injection(emb, z_sample)
-
-        # emb += th.randn_like(emb) * 0.01
-
-        # # VAE Injection at start also for maps
-        # if self.vae_loc == "maps":
-        #     xt = self.vae_injection(xt, z_sample, index = 0)
-
- 
-        # xt_noise = th.randn_like(xt) * 0.01
-        # xt = th.cat([xt, xt_noise], dim=1)
-        
-        # xt += th.randn_like(xt) * 0.01
         
         h = xt.type(self.dtype)
         for i, module in enumerate(self.input_blocks):
@@ -1305,9 +1287,6 @@ class VAEUnet(nn.Module):
                 h = self.vae_injection(h, z_sample, index = i - 1) 
 
             h = module(h, emb)
-            
-            # Encoder Noise injections
-            # h += th.randn_like(h) * 0.005
 
             hs.append(h)
 
@@ -1320,19 +1299,13 @@ class VAEUnet(nn.Module):
         num_blocks = len(self.output_blocks)
         for j, module in enumerate(self.output_blocks):
             
-            # # Decoder Injections
-            # if self.vae_loc == "maps":
-            #     h = self.vae_injection(h, z_sample, index = j+1) # Same MLPs as downsample, indexed in reverse, +1 because we have one injection at the start
-
             h = th.cat([h, hs.pop()], dim=1)
             h = module(h, emb)
         
-        # # Injection added to feature map at every downsample step
-        # if self.vae_loc == "maps":
-        #     h = self.vae_injection(h, z_sample, index = -1) # Same MLPs as downsample, indexed in reverse
+        # Injection added to feature map at every downsample step
+        if self.vae_loc == "maps":
+            h = self.vae_injection(h, z_sample, index = -1) # Same MLPs as downsample, indexed in reverse
         
-        #h = h + th.randn(xt.shape[0], self.model_channels, self.image_size, self.image_size).to(xt.device) * 0.01
-
         h = h.type(xt.dtype)
         return self.out(h), kl_div
     
