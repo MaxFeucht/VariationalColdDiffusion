@@ -11,524 +11,13 @@ import copy
 import warnings
 from tqdm import tqdm
 
+from scripts.scheduler import Scheduler
+from scripts.degradation import Degradation, DCTBlur, DenoisingCoefs
 import scripts.dct_blur as torch_dct
 from scripts.ema import ExponentialMovingAverage
 
-
-
-class Scheduler:
-    def __init__(self, **kwargs):
-        self.device = kwargs['device']
-
-    def linear(self, timesteps):  # Problematic when using < 20 timesteps, as betas are then surpassing 1.0
-        """
-        linear schedule, proposed in original ddpm paper
-        """
-        scale = 1000 / timesteps
-        beta_start = scale * 0.0001
-        beta_end = scale * 0.02
-        return torch.linspace(beta_start, beta_end, timesteps, dtype = torch.float32)
-
-    def cosine(self, timesteps, s = 0.008, black = False):
-        """
-        cosine schedule
-        as proposed in https://openreview.net/forum?id=-NEXDKk8gZ
-        """
-        steps = timesteps + 1 if not black else timesteps
-        t = torch.linspace(0, timesteps, steps, dtype = torch.float32) / timesteps
-        alphas_cumprod = torch.cos((t + s) / (1 + s) * math.pi * 0.5) ** 2
-        
-        # If we want the blacking schedule, we return the alphas_cumprod
-        if black == True:
-            return alphas_cumprod
-        
-        alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
-        betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
-        return torch.clip(betas, 0, 0.999)
-        
-    def sigmoid(self, timesteps, start = -3, end = 3, tau = 1):
-        """
-        sigmoid schedule
-        proposed in https://arxiv.org/abs/2212.11972 - Figure 8
-        better for images > 64x64, when used during training
-        """
-        steps = timesteps + 1
-        t = torch.linspace(0, timesteps, steps, dtype = torch.float32) / timesteps
-        v_start = torch.tensor(start / tau).sigmoid()
-        v_end = torch.tensor(end / tau).sigmoid()
-        alphas_cumprod = (-((t * (end - start) + start) / tau).sigmoid() + v_end) / (v_end - v_start)
-        alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
-        betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
-        return torch.clip(betas, 0, 0.999)
-
-    def get_noise_schedule(self, timesteps, noise_schedule):
-        if noise_schedule == 'linear':
-            return self.linear(timesteps)
-        elif noise_schedule == 'cosine':
-            return self.cosine(timesteps)
-        elif noise_schedule == 'sigmoid':
-            return self.sigmoid(timesteps)
-        else:
-            raise ValueError('Invalid schedule type')
-
-    
-    def get_bansal_blur_schedule(self, timesteps, std = 0.01, type = 'exponential'):
-
-
-        # The standard deviation of the kernel starts at 1 and increases exponentially at the rate of 0.01.        
-        if type == 'constant':
-            return torch.ones(timesteps, dtype=torch.float32) * std
-
-        if type == 'exponential':
-            return torch.exp(std * torch.arange(timesteps, dtype=torch.float32))
-        
-        if type == 'cifar':
-            return torch.arange(timesteps, dtype=torch.float32)/100 + 0.35
     
 
-    def get_dct_sigmas(self, timesteps, image_size): 
-
-        dct_sigma_min = 1
-        dct_sigma_max = image_size
-        
-        dct_sigmas = torch.exp(torch.linspace(np.log(dct_sigma_min),
-                                                np.log(dct_sigma_max), timesteps-1, device=self.device))
-        
-        # Repeat last sigma, to have max sigma for the first non-blacked image
-        dct_sigmas = torch.cat((dct_sigmas, torch.ones(1).to(self.device) * dct_sigmas[-1]))
-
-        if timesteps == 1:
-            dct_sigmas = torch.tensor([dct_sigma_max], device=self.device, dtype = torch.float32)
-
-        return dct_sigmas
-
-
-    def get_black_schedule(self, timesteps, mode, factor = 0.95):
-        
-        t_range = torch.arange(timesteps, dtype=torch.float32)
-
-        if mode == 'linear':
-            coefs = (1 - (t_range+1) / (timesteps))  # +1 bc of zero indexing
-        
-        elif mode == 'exponential':
-            coefs = factor ** (t_range)  
-        
-        elif mode == 'cosine':
-            coefs = self.cosine(timesteps, black=True)
-        
-        # Explicitly set the last value to 0
-        coefs[-1] = 0.0
-            
-        return coefs.reshape(-1, 1, 1, 1).to(self.device)
-
-        
-        
-class Degradation:
-    
-    def __init__(self, timesteps, degradation, noise_schedule, dataset, **kwargs):
-        
-        self.timesteps = timesteps
-        self.device = kwargs['device']
-        self.image_size = kwargs['image_size'] 
-        self.scheduler = Scheduler(device = self.device)
-        
-        assert degradation in ['noise', 'blur', 'blur_bansal', 'black', 'black_blur', 'black_blur_bansal', 'black_noise', 'blur_diffusion', 'black_blur_diffusion', 'pixelation', 'black_pixelation'], f'Invalid degradation type, choose from noise, blur, blur_bansal, black, black_blur, black_noise, blur_diffusion. Input: {degradation}'
-        self.degradation = degradation
-                
-        # Denoising 
-        self.noise_coefs = DenoisingCoefs(timesteps=timesteps, noise_schedule=noise_schedule, device = self.device)
-
-        # Blacking
-        self.blacking_coefs = self.scheduler.get_black_schedule(timesteps = timesteps, mode = 'cosine')
-
-
-        # Blurring
-        blur_kwargs = {'channels': 1 if 'mnist' in dataset else 3, 
-                        'kernel_size': 5 if 'mnist' in dataset else 27, # Change to 11 for non-cold start but for conditional sampling (only blurring for 40 steps)
-                        'kernel_std': 2 if 'mnist' in dataset else 0.01, # if dataset == 'mnist' else 0.001, # Std has a different interpretation for constant schedule and exponential schedule: constant schedule is the actual std, exponential schedule is the rate of increase # 7 if dataset == 'mnist' else 0.01
-                        'timesteps': timesteps, 
-                        'blur_routine': 'cifar' if dataset == 'cifar10' else 'constant' if 'mnist' in dataset else 'exponential',
-                        'mode': 'circular' if 'mnist' in dataset else 'reflect',
-                        'dataset': dataset,
-                        'image_size': kwargs['image_size'], 
-                        'device': self.device} # if 'mnist' in dataset else 'exponential'} # 'constant' if dataset == 'mnist' else 'exponential'}
-            
-        self.blur = Blurring(**blur_kwargs)
-        
-        # Bansal Blurring
-        self.blur.get_kernels() # Initialize kernels for Bansal Blurring
-        self.blur.gaussian_kernels.to(self.device)  # Move kernels to GPU
-        
-        # DCT Blurring
-        self.dct_blur = self.blur.get_dct_blur() # Initialize DCT Blurring
-
-        # Pixelation 
-        if 'pixelation' in degradation:
-            assert not timesteps > kwargs['image_size'], 'Number of timesteps must be smaller than the image size for pixelation'
-        self.pixel_coefs = torch.exp(torch.linspace(np.log(1.5), np.log(kwargs['image_size']/2 + 5), 10)) # log scale coefs to have smooth transitions in beginning
-        self.pixel_coefs = [int(pix) for pix in self.pixel_coefs] # int for compatibility / efficiency with F.interpolate
-    
-
-    def noising(self, x_0, t, noise = None):
-        """
-        Function to add noise to an image x at time t.
-        
-        :param torch.Tensor x_0: The original image
-        :param int t: The time step
-        :return torch.Tensor: The degraded image at time t
-        """
-
-        if noise is None:
-            noise = torch.randn_like(x_0, device = self.device)
-            warnings.warn('Noise not provided, using random noise')
-
-        x_0_coef, residual_coef = self.noise_coefs.forward_process(t)
-        x_0_coef, residual_coef = x_0_coef.to(self.device), residual_coef.to(self.device)
-        x_t = x_0_coef * x_0 + residual_coef * noise
-        return x_t
-
-
-    def bansal_blurring(self, x_0, t):
-        """
-        Function to blur an image x at time t.
-        
-        :param torch.Tensor x_0: The original image
-        :param int t: The time step
-        :return torch.Tensor: The degraded image at time t
-        """
-
-        # Freeze kernels
-        for kernel in self.blur.gaussian_kernels:
-            kernel.requires_grad = False
-
-        x = x_0
-        
-        # Keep gradients for the original image for backpropagation
-        if x_0.requires_grad:
-            x.retain_grad()
-
-        t_max = torch.max(t)
-
-        # Blur all images to the max, but store all intermediate blurs for later retrieval         
-        max_blurs = []
-
-        if t_max+1 == 0:
-            max_blurs.append(x)
-        else:
-            for i in range(t_max + 1): ## +1 to account for zero indexing of range
-                x = x.unsqueeze(0) if len(x.shape) == 2  else x
-                x = self.blur.gaussian_kernels[i](x).squeeze(0) 
-                if i == (self.timesteps-1):
-                    x = torch.mean(x, [2, 3], keepdim=True)
-                    x = x.expand(x_0.shape[0], x_0.shape[1], x_0.shape[2], x_0.shape[3])
-
-                max_blurs.append(x)
-        
-        max_blurs = torch.stack(max_blurs)
-
-        # Choose the correct blur for each image in the batch
-        blur_t = []
-        for step in range(t.shape[0]):
-            if t[step] != -1:
-                blur_t.append(max_blurs[t[step], step])
-            else:
-                blur_t.append(x_0[step])
-
-        return torch.stack(blur_t)
-    
-
-    def bansal_blackblurring_xt(self, x_tm1, t):
-        """
-        Function to blur an image x at time t.
-        
-        :param torch.Tensor x_tm1: Degraded image at time t-1
-        :param int t: The time step
-        :return torch.Tensor x_t: The degraded image at time t
-        """
-
-        x = x_tm1
-
-        t_max = torch.max(t)
-
-        if t_max == -1:
-            return x_tm1
-        else:
-            # Blur all t that are not max t (Error otherwise)
-            x = x.unsqueeze(0) if len(x.shape) == 2  else x
-            x_t = self.blur.gaussian_kernels[t_max](x).squeeze(0)  
-            
-            # Blacking just for one step
-            mult_tm1 = self.blacking_coefs[t-1] if t_max-1 != -1 else 1.0
-            mult_t = self.blacking_coefs[t]
-            mult = mult_t / mult_tm1
-            x_t = mult * x_t 
-
-            return x_t
-                
-
-    def dct_blurring(self, x_0, t):
-        xt = self.dct_blur(x_0, t).float()
-        return xt
-    
-
-    def blur_diffusion(self, x_0, t, s = 0.001, noise = None):
-    
-        if noise is None:
-                noise = torch.randn_like(x_0, device = self.device)
-                warnings.warn('Noise not provided, using random noise')
-        
-        # Noise Coefficients
-        a_t = (torch.cos((t + s) / (1 + s) * math.pi * 0.5)**2).to(self.device)
-        sig_t = 1 - a_t
-
-        # Blur Coefficients
-        #max_blur_sigma = self.dct_blur.blur_sigmas[-1] * 10 # In Hoogeboom a tunable hyperparameter
-        max_blur_sigma = self.image_size/2
-        sig_B_t = (max_blur_sigma * sig_t)[:, None, None, None]
-        tau = sig_B_t**2/2
-        dt = (1 - 0.001) * torch.exp(-self.dct_blur.frequencies_squared * tau) + 0.001
-
-        # Combined Coefficients
-        alpha = torch.sqrt(a_t[:, None, None, None]) * dt
-        sigma = sig_B_t # Potentially has to be expanded to the correct shape
-
-        # V_Transpose
-        freq_data = torch_dct.dct_2d(x_0, norm='ortho')
-        freq_noise = torch_dct.dct_2d(noise, norm='ortho')
-        freq_latent = alpha * freq_data + sigma * freq_noise
-
-        # V
-        latent = torch_dct.idct_2d(freq_latent, norm='ortho')
-
-        return latent #, freq_noise
-
-
-    def pixelate(self, x, coef):
-        og_shape = x.shape
-        x = F.interpolate(x, scale_factor=1/coef, mode='nearest')
-        x = F.interpolate(x, size=og_shape[2:], mode='nearest')
-        return x
-
-
-
-    def bansal_pixelation(self, x_0, t):
-        """
-        Function to pixelate an image x at time t.
-        
-        :param torch.Tensor x_0: The original image
-        :param int t: The time step
-        :return torch.Tensor: The degraded image at time t
-        """
-
-        t_max = torch.max(t)
-
-        # Pixelate all images to the max, but store all intermediate blurs for later retrieval         
-        max_pix = []
-
-        if t_max+1 == 0:
-            max_pix.append(x_0)
-        else:
-            for i in range(t_max + 1): ## +1 to account for zero indexing of range
-                x = self.pixelate(x_0, self.pixel_coefs[i])
-                max_pix.append(x)
-        
-        max_pix = torch.stack(max_pix)
-
-        # Choose the correct pixelation for each image in the batch
-        pix_t = []
-        for step in range(t.shape[0]):
-            if t[step] != -1:
-                pix_t.append(max_pix[t[step], step])
-            else:
-                pix_t.append(x_0[step])
-
-        return torch.stack(pix_t)
-
-
-    def blacking(self, x_0, t):
-        """
-        Function to fade an image x to black at time t.
-        
-        :param torch.Tensor x_0: The original image
-        :param int t: The time step
-        :return torch.Tensor: The degraded image at time t
-        """
-
-        multiplier = self.blacking_coefs[t]
-        multiplier[t == -1] = 1.0
-        x_t = multiplier * x_0 
-        return x_t
-    
-    
-    def degrade(self, x, t, noise = None):
-        """
-        Function to degrade an image x at time t.
-        
-        :param x: torch.Tensor
-            The image at time t
-        :param t: int
-            The time step
-            
-        :return: torch.Tensor
-            The degraded image at time t
-        """
-        if self.degradation == 'noise':
-            return self.noising(x, t, noise)
-        elif self.degradation == 'black_noise':
-            return self.blacking(self.noising(x, t, noise), t)
-        elif self.degradation == 'blur':
-            return self.dct_blurring(x, t)
-        elif self.degradation == 'black':
-            return self.blacking(x, t)
-        elif self.degradation == 'black_blur':
-            return self.blacking(self.dct_blurring(x, t), t)
-        elif self.degradation == 'blur_bansal':
-            return self.bansal_blurring(x, t)
-        elif self.degradation == 'black_blur_bansal':
-            return self.blacking(self.bansal_blurring(x, t), t)
-        elif self.degradation == 'blur_diffusion':
-            return self.blur_diffusion(x, t)
-        elif self.degradation == 'black_blur_diffusion':
-            return self.blacking(self.blur_diffusion(x, t), t)
-        elif self.degradation == 'pixelation':
-            return self.bansal_pixelation(x, t)
-        elif self.degradation == 'black_pixelation':
-            return self.blacking(self.bansal_pixelation(x, t), t)
-
-
-
-class Blurring:
-    
-    def __init__(self, timesteps, channels, image_size, kernel_size, kernel_std, blur_routine, mode, dataset, device):
-            """
-            Initializes the Blurring class.
-
-            Args:
-                channels (int): Number of channels in the input image. Default is 3.
-                kernel_size (int): Size of the kernel used for blurring. Default is 11.
-                kernel_std (int): Standard deviation of the kernel used for blurring. Default is 7.
-                num_timesteps (int): Number of diffusion timesteps. Default is 40.
-                blur_routine (str): Routine used for blurring. Default is 'Constant'.
-            """
-            self.scheduler = Scheduler(device=device)
-
-            self.channels = channels
-            self.image_size = image_size
-            self.kernel_size = kernel_size
-            self.kernel_stds = self.scheduler.get_bansal_blur_schedule(timesteps = timesteps, std = kernel_std, type = blur_routine) 
-            self.dct_sigmas = self.scheduler.get_dct_sigmas(timesteps, image_size = image_size)
-            self.num_timesteps = timesteps
-            self.blur_routine = blur_routine
-            self.mode = mode
-            self.device = device
-        
-
-    def get_conv(self, dims, std, mode):
-        """
-        Function to obtain a 2D convolutional layer with a Gaussian Blurring kernel.
-        
-        :param tuple dims: The dimensions of the kernel
-        :param tuple std: The standard deviation of the kernel
-        :param str mode: The padding mode
-        :return nn.Conv2d: The 2D convolutional layer with the Gaussian Blurring kernel
-        """
-        
-        kernel = tgm.image.get_gaussian_kernel2d(dims, std) 
-        conv = nn.Conv2d(in_channels=self.channels, out_channels=self.channels, kernel_size=dims, padding=int((dims[0]-1)/2), padding_mode=mode,
-                         bias=False, groups=self.channels)
-         
-        kernel = torch.unsqueeze(kernel, 0)
-        kernel = torch.unsqueeze(kernel, 0)
-        kernel = kernel.repeat(self.channels, 1, 1, 1)
-        conv.weight = nn.Parameter(kernel, requires_grad=False)
-
-        return conv
-
-
-    def get_kernels(self):
-        """
-        Function to obtain a list of 2D convolutional layers with Gaussian Blurring kernels following a certain routine.
-        
-        :return list: A list of 2D convolutional layers with Gaussian Blurring kernels
-        """
-        
-        kernels = []
-        for i in range(self.num_timesteps):
-            kernels.append(self.get_conv((self.kernel_size, self.kernel_size), (self.kernel_stds[i], self.kernel_stds[i]), mode = self.mode)) 
-        
-        self.gaussian_kernels = nn.ModuleList(kernels).to(self.device)
-    
-
-    def get_dct_blur(self):
-        """
-        Function to obtain and initialize the DCT Blur class.
-        """
-
-        dct_blur = DCTBlur(self.dct_sigmas, self.image_size, self.device)
-
-        return dct_blur
-    
-
-
-class DenoisingCoefs:
-    
-    
-    def __init__(self, timesteps, noise_schedule, device, **kwargs):
-        self.timesteps = timesteps
-        self.scheduler = Scheduler(device=device)
-        
-        self.betas = self.scheduler.get_noise_schedule(self.timesteps, noise_schedule=noise_schedule).to(device)
-        self.alphas = 1. - self.betas
-        self.alphas_cumprod = torch.cumprod(self.alphas, dim=0)
-        self.alphas_cumprod_prev = torch.cat([torch.tensor([1.], device=device), self.alphas_cumprod[:-1]])
-    
-    
-    def forward_process(self, t):
-        """
-        Function to obtain the coefficients for the standard Denoising Diffusion process xt = sqrt(alphas_cumprod) * x0 + sqrt(1 - alphas_cumprod) * N(0, I).
-        
-        :param x: torch.Tensor
-            The image at time t
-        :param t: int
-            The time step
-            
-        :return: tuple
-            The coefficients for the Denoising Diffusion process
-        """
-        alpha_t = self.alphas_cumprod.gather(-1, t).reshape(-1, 1, 1, 1)
-        x0_coef = torch.sqrt(alpha_t)
-        residual_coef =  torch.sqrt(1. - alpha_t)
-        return x0_coef, residual_coef
-    
-    
-    def posterior(self, t):
-        """
-        Function to obtain the coefficients for the Denoising Diffusion posterior 
-        q(x_{t-1} | x_t, x_0).
-        """
-        beta_t = self.betas.gather(-1, t).reshape(-1, 1, 1, 1)
-        alphas_cumprod_t = self.alphas_cumprod.gather(-1, t).reshape(-1, 1, 1, 1)
-        alphas_cumprod_prev_t = self.alphas_cumprod_prev.gather(-1, t).reshape(-1, 1, 1, 1)
-        
-        posterior_variance = beta_t * (1. - alphas_cumprod_prev_t) / (1. - alphas_cumprod_t) # beta_hat
-        posterior_mean_x0 = beta_t * torch.sqrt(alphas_cumprod_prev_t) / (1. - alphas_cumprod_t) #x_0
-        posterior_mean_xt = (1. - alphas_cumprod_prev_t) * torch.sqrt(self.alphas.gather(-1,t).reshape(-1, 1, 1, 1)) / (1. - alphas_cumprod_t) #x_t
-
-        return posterior_mean_x0, posterior_mean_xt, posterior_variance
-    
-    
-    def x0_restore(self, t):
-        """
-        Function to obtain the coefficients for the Denoising Diffusion reconstruction.
-        
-        :param int t: The time step
-        :return tuple: The coefficients for the Denoising Diffusion process
-        """
-        
-        xt_coef = torch.sqrt(1. / self.alphas_cumprod.gather(-1, t)).reshape(-1, 1, 1, 1)
-        residual_coef = torch.sqrt(1. / self.alphas_cumprod.gather(-1, t) - 1).reshape(-1, 1, 1, 1)
-
-        return xt_coef, residual_coef
 
 class Reconstruction:
     
@@ -637,7 +126,6 @@ class Trainer:
         self.cold_warmup_passed = False
         self.cyclic_annealing = False#True
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=lr, betas=(0.9, 0.99))
-        #self.lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, "min", factor=0.3, patience=30)
         self.lr_scheduler = torch.optim.lr_scheduler.StepLR(self.optimizer, step_size=500, gamma=0.75) # Halve learning rate ever 300 epochs
         self.apply_ema = not kwargs['skip_ema']
         self.test_run = True if kwargs['test_run'] else False
@@ -651,6 +139,17 @@ class Trainer:
 
 
     def train_iter(self, x_0, t, t2=None, noise=None):
+
+        """
+        Function to perform a training iteration for an arbitrarily defined Diffusion Model.
+
+        :param torch.Tensor x_0: The original image
+        :param int t: The time step
+        :param int t2: The second time step for Variable Timestep Diffusion
+        :param torch.Tensor noise: The noise to degrade with for Denoising Diffusion
+
+        :return torch.Tensor: The loss for the training iteration
+        """
 
         # Degrade and obtain residual
         if not self.deterministic:
@@ -849,6 +348,15 @@ class Trainer:
     
     
     def train_epoch(self, dataloader, val = False):
+
+        """
+        Function to perform a training epoch for an arbitrarily defined Diffusion Model.
+
+        :param DataLoader dataloader: The dataloader containing the data
+        :param bool val: Whether the model is in evaluation mode
+
+        :return float: The average loss for the training epoch
+        """
         
         # Set model to train mode
         if not val:
@@ -1022,6 +530,15 @@ class Sampler:
 
     @torch.no_grad() 
     def sample_ddpm(self, model, batch_size):
+        """
+        Function to sample from a trained DDPM model. Follows a common implementation of the DDPM sampling algorithm in 
+        https://github.com/lucidrains/denoising-diffusion-pytorch
+
+        :param nn.Module model: The trained DDPM model
+        :param int batch_size: The batch size of the samples
+
+        :return list: A list of samples
+        """
 
         model.eval()
 
@@ -1050,10 +567,28 @@ class Sampler:
  
 
     @torch.no_grad()
-    def sample_cold(self, model, batch_size = 16, x0=None, generate=False, prior=None, t_inject=None, t2=None, t_diff=1):
+    def sample_cold(self, model, batch_size = 16, x0=None, generate=False, prior=None, t2=None, t_diff=1):
+
+        """
+        Function to sample from a trained deterministic diffusion model. 
+        Includes 
+        - sampling for variable timestep diffusion
+        - sampling a model with x0 parameterization
+        - sampling a model with xt parameterization
+
+        :param nn.Module model: The trained DDPM model
+        :param int batch_size: The batch size of the samples
+        :param torch.Tensor x0: The original image
+        :param bool generate: Whether to generate a new x_T or degrade an existing x0 to x_T
+        :param torch.Tensor prior: The prior for the VAE model
+        :param int t2: The second time step for Variable Timestep Diffusion
+        :param int t_diff: The difference between timesteps for Variable Timestep Diffusion
+
+        :return list: A list of samples
+        """
+
 
         model.eval()
-
         t=self.timesteps
 
         # Sample x_T either every time new or once and keep it fixed 
@@ -1150,7 +685,19 @@ class Sampler:
         return samples, xT, direct_recons, xt
 
 
-    def sample(self, model, batch_size, x0=None, prior=None, generate=False, t_inject=None, t_diff=1):
+    def sample(self, model, batch_size, x0=None, prior=None, generate=False, t_diff=1):
+        """
+        Function to sample from a trained diffusion model.
+
+        :param nn.Module model: The trained diffusion model
+        :param int batch_size: The batch size of the samples
+        :param torch.Tensor x0: The original image
+        :param torch.Tensor prior: The prior for the VAE model
+        :param bool generate: Whether to generate a new x_T or degrade an existing x0 to x_T
+        :param int t_diff: The difference between timesteps for Variable Timestep Diffusion
+
+        :return list: A list of samples
+        """
         
         if self.deterministic:
             return self.sample_cold(model, 
@@ -1158,7 +705,6 @@ class Sampler:
                                     x0, 
                                     generate=generate, 
                                     prior=prior, 
-                                    t_inject=t_inject,
                                     t_diff=t_diff)
         else:
             return self.sample_ddpm(model, batch_size)
@@ -1166,65 +712,7 @@ class Sampler:
         
 
 
-class DCTBlur(nn.Module):
 
-    def __init__(self, blur_sigmas, image_size, device):
-        super(DCTBlur, self).__init__()
-        self.blur_sigmas = blur_sigmas.clone().detach().to(device)
-        freqs = np.pi*torch.linspace(0, image_size-1,
-                                    image_size).to(device)/image_size
-        self.frequencies_squared = freqs[:, None]**2 + freqs[None, :]**2
-
-    def forward(self, x, fwd_steps):
-        if len(x.shape) == 4:
-            sigmas = self.blur_sigmas[fwd_steps][:, None, None, None]
-        elif len(x.shape) == 3:
-            sigmas = self.blur_sigmas[fwd_steps][:, None, None]
-        t = sigmas**2/2
-        dct_coefs = torch_dct.dct_2d(x, norm='ortho')
-        dct_coefs = dct_coefs * torch.exp(- self.frequencies_squared * t)
-        dct_blurred = torch_dct.idct_2d(dct_coefs, norm='ortho')
-        dct_blurred[fwd_steps == -1] = x[fwd_steps == -1] # Keep the original image for t=-1 (needed for Bansal style sampling)
-        return dct_blurred
-
-
-# Custom DCT Blur Module for Bansal Style Sampling
-class DCTBlurSampling(nn.Module):
-
-    def __init__(self, blur_sigmas, image_size, device):
-        super(DCTBlurSampling, self).__init__()
-        self.blur_sigmas = blur_sigmas.clone().detach().to(device)
-        freqs = np.pi*torch.linspace(0, image_size-1,
-                                    image_size).to(device)/image_size
-        self.frequencies_squared = freqs[:, None]**2 + freqs[None, :]**2
-
-    def forward(self, x, fwd_steps = None, t = None):
-        if fwd_steps is None:
-            sigmas = self.blur_sigmas[:, None, None, None]
-        else:
-            if len(x.shape) == 4:
-                sigmas = self.blur_sigmas[fwd_steps][:, None, None, None]
-            elif len(x.shape) == 3:
-                sigmas = self.blur_sigmas[fwd_steps][:, None, None]
-                print(sigmas)
-        
-        if t is None:
-            t = sigmas**2/2
-        else:
-            pass
-            
-        dct_coefs = torch_dct.dct_2d(x, norm='ortho')
-        dct_coefs = dct_coefs * torch.exp(- self.frequencies_squared * t)
-        dct_blurred = torch_dct.idct_2d(dct_coefs, norm='ortho')
-
-        if t is None:
-            dct_blurred[fwd_steps == -1] = x[fwd_steps == -1] # Keep the original image for t=-1 (needed for Bansal style sampling)
-        
-            if fwd_steps[0] == -1:
-                print("Sampling End reached, returning original image.")
-
-        return dct_blurred
-    
 
 
 

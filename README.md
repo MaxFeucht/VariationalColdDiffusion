@@ -4,7 +4,7 @@ We present Variational Cold Diffusion (VCD), a framework for diffusion-like syst
 
 ## Code Structure
 
-Classes for the Diffusion Forward and Reverse processes and for training and sampling are defined in [diffusion.py](/scripts/diffusion.py). This includes degradation operators, schedules, reconstruction operations, the trainer class and the sampler class. The model setup defined in the config files is run in [main.py](/main.py). Figures other than unconditional generations are created with [experiments.ipynb](/experiments.ipynb).
+Classes pertaining to the Diffusion forward process are defined in [degradation.py](/scripts/degradation.py) and degradation schedules are implemented in [scheduler.py](/scripts/scheduler.py). The Trainer and Sampler are defined in [diffusion.py](/scripts/diffusion.py). The config files determine the model setup that is run in [main.py](/main.py). Figures other than unconditional generations are created with [experiments.ipynb](/experiments.ipynb).
 
 ## Usage
 
